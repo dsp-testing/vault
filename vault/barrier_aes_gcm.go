@@ -905,6 +905,7 @@ func (b *AESGCMBarrier) aeadFromKey(key []byte) (cipher.AEAD, error) {
 	return gcm, nil
 }
 
+
 // encrypt is used to encrypt a value
 func (b *AESGCMBarrier) encrypt(path string, term uint32, gcm cipher.AEAD, plain []byte) ([]byte, error) {
 	// Allocate the output buffer with room for tern, version byte,

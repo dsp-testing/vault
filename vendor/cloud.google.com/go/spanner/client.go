@@ -25,24 +25,37 @@ import (
 	"time"
 
 	"cloud.google.com/go/internal/trace"
-	instance "cloud.google.com/go/spanner/admin/instance/apiv1"
+	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	"google.golang.org/api/option"
+	"google.golang.org/api/option/internaloption"
 	gtransport "google.golang.org/api/transport/grpc"
-	instancepb "google.golang.org/genproto/googleapis/spanner/admin/instance/v1"
-	sppb "google.golang.org/genproto/googleapis/spanner/v1"
-	field_mask "google.golang.org/genproto/protobuf/field_mask"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
+
+	vkit "cloud.google.com/go/spanner/apiv1"
+	"cloud.google.com/go/spanner/internal"
+
+	// Install google-c2p resolver, which is required for direct path.
+	_ "google.golang.org/grpc/xds/googledirectpath"
+	// Install RLS load balancer policy, which is needed for gRPC RLS.
+	_ "google.golang.org/grpc/balancer/rls"
 )
 
 const (
-	endpoint = "spanner.googleapis.com:443"
-
 	// resourcePrefixHeader is the name of the metadata header used to indicate
 	// the resource being operated on.
 	resourcePrefixHeader = "google-cloud-resource-prefix"
+
+	// routeToLeaderHeader is the name of the metadata header if RW/PDML
+	// requests need  to route to leader.
+	routeToLeaderHeader = "x-goog-spanner-route-to-leader"
+
+	requestsCompressionHeader = "x-response-encoding"
+
+	// numChannels is the default value for NumChannels of client.
+	numChannels = 4
 )
 
 const (
@@ -54,8 +67,7 @@ const (
 )
 
 var (
-	validDBPattern       = regexp.MustCompile("^projects/(?P<project>[^/]+)/instances/(?P<instance>[^/]+)/databases/(?P<database>[^/]+)$")
-	validInstancePattern = regexp.MustCompile("^projects/(?P<project>[^/]+)/instances/(?P<instance>[^/]+)")
+	validDBPattern = regexp.MustCompile("^projects/(?P<project>[^/]+)/instances/(?P<instance>[^/]+)/databases/(?P<database>[^/]+)$")
 )
 
 func validDatabaseName(db string) error {
@@ -64,15 +76,6 @@ func validDatabaseName(db string) error {
 			db, validDBPattern.String())
 	}
 	return nil
-}
-
-func getInstanceName(db string) (string, error) {
-	matches := validInstancePattern.FindStringSubmatch(db)
-	if len(matches) == 0 {
-		return "", fmt.Errorf("Failed to retrieve instance name from %q according to pattern %q",
-			db, validInstancePattern.String())
-	}
-	return matches[0], nil
 }
 
 func parseDatabaseName(db string) (project, instance, database string, err error) {
@@ -87,10 +90,21 @@ func parseDatabaseName(db string) (project, instance, database string, err error
 // Client is a client for reading and writing data to a Cloud Spanner database.
 // A client is safe to use concurrently, except for its Close method.
 type Client struct {
-	sc           *sessionClient
-	idleSessions *sessionPool
-	logger       *log.Logger
-	qo           QueryOptions
+	sc                   *sessionClient
+	idleSessions         *sessionPool
+	logger               *log.Logger
+	qo                   QueryOptions
+	ro                   ReadOptions
+	ao                   []ApplyOption
+	txo                  TransactionOptions
+	ct                   *commonTags
+	disableRouteToLeader bool
+}
+
+// DatabaseName returns the full name of a database, e.g.,
+// "projects/spanner-cloud-test/instances/foo/databases/foodb".
+func (c *Client) DatabaseName() string {
+	return c.sc.database
 }
 
 // ClientConfig has configurations for the client.
@@ -115,67 +129,74 @@ type ClientConfig struct {
 	// QueryOptions is the configuration for executing a sql query.
 	QueryOptions QueryOptions
 
-	// logger is the logger to use for this client. If it is nil, all logging
+	// ReadOptions is the configuration for reading rows from a database
+	ReadOptions ReadOptions
+
+	// ApplyOptions is the configuration for applying
+	ApplyOptions []ApplyOption
+
+	// TransactionOptions is the configuration for a transaction.
+	TransactionOptions TransactionOptions
+
+	// CallOptions is the configuration for providing custom retry settings that
+	// override the default values.
+	CallOptions *vkit.CallOptions
+
+	// UserAgent is the prefix to the user agent header. This is used to supply information
+	// such as application name or partner tool.
+	//
+	// Internal Use Only: This field is for internal tracking purpose only,
+	// setting the value for this config is not required.
+	//
+	// Recommended format: ``application-or-tool-ID/major.minor.version``.
+	UserAgent string
+
+	// DatabaseRole specifies the role to be assumed for all operations on the
+	// database by this client.
+	DatabaseRole string
+
+	// DisableRouteToLeader specifies if all the requests of type read-write and PDML
+	// need to be routed to the leader region.
+	//
+	// Default: false
+	DisableRouteToLeader bool
+
+	// Logger is the logger to use for this client. If it is nil, all logging
 	// will be directed to the standard logger.
-	logger *log.Logger
+	Logger *log.Logger
+
+	//
+	// Sets the compression to use for all gRPC calls. The compressor must be a valid name.
+	// This will enable compression both from the client to the
+	// server and from the server to the client.
+	//
+	// Supported values are:
+	//  gzip: Enable gzip compression
+	//  identity: Disable compression
+	//
+	//  Default: identity
+	Compression string
+
+	// BatchTimeout specifies the timeout for a batch of sessions managed sessionClient.
+	BatchTimeout time.Duration
 }
 
-// errDial returns error for dialing to Cloud Spanner.
-func errDial(ci int, err error) error {
-	e := toSpannerError(err).(*Error)
-	e.decorate(fmt.Sprintf("dialing fails for channel[%v]", ci))
-	return e
-}
-
-func contextWithOutgoingMetadata(ctx context.Context, md metadata.MD) context.Context {
+func contextWithOutgoingMetadata(ctx context.Context, md metadata.MD, disableRouteToLeader bool) context.Context {
 	existing, ok := metadata.FromOutgoingContext(ctx)
 	if ok {
 		md = metadata.Join(existing, md)
 	}
+	if !disableRouteToLeader {
+		md = metadata.Join(md, metadata.Pairs(routeToLeaderHeader, "true"))
+	}
 	return metadata.NewOutgoingContext(ctx, md)
-}
-
-// getInstanceEndpoint returns an instance-specific endpoint if one exists. If
-// multiple endpoints exist, it returns the first one.
-func getInstanceEndpoint(ctx context.Context, database string, opts ...option.ClientOption) (string, error) {
-	instanceName, err := getInstanceName(database)
-	if err != nil {
-		return "", fmt.Errorf("Failed to resolve endpoint: %v", err)
-	}
-
-	c, err := instance.NewInstanceAdminClient(ctx, opts...)
-	if err != nil {
-		return "", err
-	}
-	defer c.Close()
-
-	req := &instancepb.GetInstanceRequest{
-		Name: instanceName,
-		FieldMask: &field_mask.FieldMask{
-			Paths: []string{"endpoint_uris"},
-		},
-	}
-
-	resp, err := c.GetInstance(ctx, req)
-	if err != nil {
-		return "", err
-	}
-
-	endpointURIs := resp.GetEndpointUris()
-
-	if len(endpointURIs) > 0 {
-		return endpointURIs[0], nil
-	}
-
-	// Return empty string when no endpoints exist.
-	return "", nil
 }
 
 // NewClient creates a client to a database. A valid database name has the
 // form projects/PROJECT_ID/instances/INSTANCE_ID/databases/DATABASE_ID. It uses
 // a default configuration.
 func NewClient(ctx context.Context, database string, opts ...option.ClientOption) (*Client, error) {
-	return NewClientWithConfig(ctx, database, ClientConfig{SessionPoolConfig: DefaultSessionPoolConfig}, opts...)
+	return NewClientWithConfig(ctx, database, ClientConfig{SessionPoolConfig: DefaultSessionPoolConfig, DisableRouteToLeader: false}, opts...)
 }
 
 // NewClientWithConfig creates a client to a database. A valid database name has
@@ -195,61 +216,23 @@ func NewClientWithConfig(ctx context.Context, database string, config ClientConf
 			option.WithEndpoint(emulatorAddr),
 			option.WithGRPCDialOption(grpc.WithInsecure()),
 			option.WithoutAuthentication(),
+			internaloption.SkipDialSettingsValidation(),
 		}
 		opts = append(emulatorOpts, opts...)
-	} else if os.Getenv("GOOGLE_CLOUD_SPANNER_ENABLE_RESOURCE_BASED_ROUTING") == "true" {
-		// Fetch the instance-specific endpoint.
-		reqOpts := []option.ClientOption{option.WithEndpoint(endpoint)}
-		reqOpts = append(reqOpts, opts...)
-		instanceEndpoint, err := getInstanceEndpoint(ctx, database, reqOpts...)
-
-		if err != nil {
-			// If there is a PermissionDenied error, fall back to use the global endpoint
-			// or the user-specified endpoint.
-			if status.Code(err) == codes.PermissionDenied {
-				logf(config.logger, `
-Warning: The client library attempted to connect to an endpoint closer to your
-Cloud Spanner data but was unable to do so. The client library will fall back
-and route requests to the endpoint given in the client options, which may
-result in increased latency. We recommend including the scope
-https://www.googleapis.com/auth/spanner.admin so that the client library can
-get an instance-specific endpoint and efficiently route requests.
-`)
-			} else {
-				return nil, err
-			}
-		}
-
-		if instanceEndpoint != "" {
-			opts = append(opts, option.WithEndpoint(instanceEndpoint))
-		}
 	}
 
 	// Prepare gRPC channels.
-	configuredNumChannels := config.NumChannels
+	hasNumChannelsConfig := config.NumChannels > 0
 	if config.NumChannels == 0 {
 		config.NumChannels = numChannels
 	}
 	// gRPC options.
-	allOpts := []option.ClientOption{
-		option.WithEndpoint(endpoint),
-		option.WithScopes(Scope),
-		option.WithGRPCDialOption(
-			grpc.WithDefaultCallOptions(
-				grpc.MaxCallSendMsgSize(100<<20),
-				grpc.MaxCallRecvMsgSize(100<<20),
-			),
-		),
-		option.WithGRPCConnectionPool(config.NumChannels),
-	}
-	// opts will take precedence above allOpts, as the values in opts will be
-	// applied after the values in allOpts.
-	allOpts = append(allOpts, opts...)
+	allOpts := allClientOpts(config.NumChannels, config.Compression, opts...)
 	pool, err := gtransport.DialPool(ctx, allOpts...)
 	if err != nil {
 		return nil, err
 	}
-	if configuredNumChannels > 0 && pool.Num() != config.NumChannels {
+	if hasNumChannelsConfig && pool.Num() != config.NumChannels {
 		pool.Close()
 		return nil, spannerErrorf(codes.InvalidArgument, "Connection pool mismatch: NumChannels=%v, WithGRPCConnectionPool=%v. Only set one of these options, or set both to the same value.", config.NumChannels, pool.Num())
 	}
@@ -269,8 +252,20 @@ get an instance-specific endpoint and efficiently route requests.
 	if config.MaxBurst == 0 {
 		config.MaxBurst = DefaultSessionPoolConfig.MaxBurst
 	}
+	if config.incStep == 0 {
+		config.incStep = DefaultSessionPoolConfig.incStep
+	}
+	if config.BatchTimeout == 0 {
+		config.BatchTimeout = time.Minute
+	}
+
+	md := metadata.Pairs(resourcePrefixHeader, database)
+	if config.Compression == gzip.Name {
+		md.Append(requestsCompressionHeader, gzip.Name)
+	}
 	// Create a session client.
-	sc := newSessionClient(pool, database, sessionLabels, metadata.Pairs(resourcePrefixHeader, database), config.logger)
+	sc := newSessionClient(pool, database, config.UserAgent, sessionLabels, config.DatabaseRole, config.DisableRouteToLeader, md, config.BatchTimeout, config.Logger, config.CallOptions)
+
 	// Create a session pool.
 	config.SessionPoolConfig.sessionLabels = sessionLabels
 	sp, err := newSessionPool(sc, config.SessionPoolConfig)
@@ -279,12 +274,35 @@ get an instance-specific endpoint and efficiently route requests.
 		return nil, err
 	}
 	c = &Client{
-		sc:           sc,
-		idleSessions: sp,
-		logger:       config.logger,
-		qo:           getQueryOptions(config.QueryOptions),
+		sc:                   sc,
+		idleSessions:         sp,
+		logger:               config.Logger,
+		qo:                   getQueryOptions(config.QueryOptions),
+		ro:                   config.ReadOptions,
+		ao:                   config.ApplyOptions,
+		txo:                  config.TransactionOptions,
+		ct:                   getCommonTags(sc),
+		disableRouteToLeader: config.DisableRouteToLeader,
 	}
 	return c, nil
+}
+
+// Combines the default options from the generated client, the default options
+// of the hand-written client and the user options to one list of options.
+// Precedence: userOpts > clientDefaultOpts > generatedDefaultOpts
+func allClientOpts(numChannels int, compression string, userOpts ...option.ClientOption) []option.ClientOption {
+	generatedDefaultOpts := vkit.DefaultClientOptions()
+	clientDefaultOpts := []option.ClientOption{
+		option.WithGRPCConnectionPool(numChannels),
+		option.WithUserAgent(fmt.Sprintf("spanner-go/v%s", internal.Version)),
+		internaloption.EnableDirectPath(true),
+	}
+	if compression == "gzip" {
+		userOpts = append(userOpts, option.WithGRPCDialOption(grpc.WithDefaultCallOptions(
+			grpc.UseCompressor(gzip.Name))))
+	}
+	allDefaultOpts := append(generatedDefaultOpts, clientDefaultOpts...)
+	return append(allDefaultOpts, userOpts...)
 }
 
 // getQueryOptions returns the query options overwritten by the environment
@@ -292,12 +310,16 @@ get an instance-specific endpoint and efficiently route requests.
 // via application-level configuration. If the environment variables are set,
 // this will return the overwritten query options.
 func getQueryOptions(opts QueryOptions) QueryOptions {
+	if opts.Options == nil {
+		opts.Options = &sppb.ExecuteSqlRequest_QueryOptions{}
+	}
 	opv := os.Getenv("SPANNER_OPTIMIZER_VERSION")
 	if opv != "" {
-		if opts.Options == nil {
-			opts.Options = &sppb.ExecuteSqlRequest_QueryOptions{}
-		}
 		opts.Options.OptimizerVersion = opv
+	}
+	opsp := os.Getenv("SPANNER_OPTIMIZER_STATISTICS_PACKAGE")
+	if opsp != "" {
+		opts.Options.OptimizerStatisticsPackage = opsp
 	}
 	return opts
 }
@@ -305,7 +327,9 @@ func getQueryOptions(opts QueryOptions) QueryOptions {
 // Close closes the client.
 func (c *Client) Close() {
 	if c.idleSessions != nil {
-		c.idleSessions.close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c.idleSessions.close(ctx)
 	}
 	c.sc.close()
 }
@@ -324,6 +348,8 @@ func (c *Client) Single() *ReadOnlyTransaction {
 	t.txReadOnly.sp = c.idleSessions
 	t.txReadOnly.txReadEnv = t
 	t.txReadOnly.qo = c.qo
+	t.txReadOnly.ro = c.ro
+	t.txReadOnly.disableRouteToLeader = true
 	t.txReadOnly.replaceSessionFunc = func(ctx context.Context) error {
 		if t.sh == nil {
 			return spannerErrorf(codes.InvalidArgument, "missing session handle on transaction")
@@ -339,6 +365,7 @@ func (c *Client) Single() *ReadOnlyTransaction {
 		t.sh = sh
 		return nil
 	}
+	t.ct = c.ct
 	return t
 }
 
@@ -359,6 +386,9 @@ func (c *Client) ReadOnlyTransaction() *ReadOnlyTransaction {
 	t.txReadOnly.sp = c.idleSessions
 	t.txReadOnly.txReadEnv = t
 	t.txReadOnly.qo = c.qo
+	t.txReadOnly.ro = c.ro
+	t.txReadOnly.disableRouteToLeader = true
+	t.ct = c.ct
 	return t
 }
 
@@ -381,11 +411,6 @@ func (c *Client) BatchReadOnlyTransaction(ctx context.Context, tb TimestampBound
 		sh  *sessionHandle
 		err error
 	)
-	defer func() {
-		if err != nil && sh != nil {
-			s.delete(ctx)
-		}
-	}()
 
 	// Create session.
 	s, err = c.sc.createSession(ctx)
@@ -395,7 +420,7 @@ func (c *Client) BatchReadOnlyTransaction(ctx context.Context, tb TimestampBound
 	sh = &sessionHandle{session: s}
 
 	// Begin transaction.
-	res, err := sh.getClient().BeginTransaction(contextWithOutgoingMetadata(ctx, sh.getMetadata()), &sppb.BeginTransactionRequest{
+	res, err := sh.getClient().BeginTransaction(contextWithOutgoingMetadata(ctx, sh.getMetadata(), true), &sppb.BeginTransactionRequest{
 		Session: sh.getID(),
 		Options: &sppb.TransactionOptions{
 			Mode: &sppb.TransactionOptions_ReadOnly_{
@@ -404,7 +429,7 @@ func (c *Client) BatchReadOnlyTransaction(ctx context.Context, tb TimestampBound
 		},
 	})
 	if err != nil {
-		return nil, toSpannerError(err)
+		return nil, ToSpannerError(err)
 	}
 	tx = res.Id
 	if res.ReadTimestamp != nil {
@@ -427,6 +452,9 @@ func (c *Client) BatchReadOnlyTransaction(ctx context.Context, tb TimestampBound
 	t.txReadOnly.sh = sh
 	t.txReadOnly.txReadEnv = t
 	t.txReadOnly.qo = c.qo
+	t.txReadOnly.ro = c.ro
+	t.txReadOnly.disableRouteToLeader = true
+	t.ct = c.ct
 	return t, nil
 }
 
@@ -454,6 +482,9 @@ func (c *Client) BatchReadOnlyTransactionFromID(tid BatchReadOnlyTransactionID) 
 	t.txReadOnly.sh = sh
 	t.txReadOnly.txReadEnv = t
 	t.txReadOnly.qo = c.qo
+	t.txReadOnly.ro = c.ro
+	t.txReadOnly.disableRouteToLeader = true
+	t.ct = c.ct
 	return t
 }
 
@@ -487,46 +518,82 @@ func checkNestedTxn(ctx context.Context) error {
 func (c *Client) ReadWriteTransaction(ctx context.Context, f func(context.Context, *ReadWriteTransaction) error) (commitTimestamp time.Time, err error) {
 	ctx = trace.StartSpan(ctx, "cloud.google.com/go/spanner.ReadWriteTransaction")
 	defer func() { trace.EndSpan(ctx, err) }()
+	resp, err := c.rwTransaction(ctx, f, TransactionOptions{})
+	return resp.CommitTs, err
+}
+
+// ReadWriteTransactionWithOptions executes a read-write transaction with
+// configurable options, with retries as necessary.
+//
+// ReadWriteTransactionWithOptions is a configurable ReadWriteTransaction.
+//
+// See https://godoc.org/cloud.google.com/go/spanner#ReadWriteTransaction for
+// more details.
+func (c *Client) ReadWriteTransactionWithOptions(ctx context.Context, f func(context.Context, *ReadWriteTransaction) error, options TransactionOptions) (resp CommitResponse, err error) {
+	ctx = trace.StartSpan(ctx, "cloud.google.com/go/spanner.ReadWriteTransactionWithOptions")
+	defer func() { trace.EndSpan(ctx, err) }()
+	resp, err = c.rwTransaction(ctx, f, options)
+	return resp, err
+}
+
+func (c *Client) rwTransaction(ctx context.Context, f func(context.Context, *ReadWriteTransaction) error, options TransactionOptions) (resp CommitResponse, err error) {
 	if err := checkNestedTxn(ctx); err != nil {
-		return time.Time{}, err
+		return resp, err
 	}
 	var (
-		ts time.Time
-		sh *sessionHandle
+		sh      *sessionHandle
+		t       *ReadWriteTransaction
+		attempt = 0
 	)
-	err = runWithRetryOnAbortedOrSessionNotFound(ctx, func(ctx context.Context) error {
+	defer func() {
+		if sh != nil {
+			sh.recycle()
+		}
+	}()
+	err = runWithRetryOnAbortedOrFailedInlineBeginOrSessionNotFound(ctx, func(ctx context.Context) error {
 		var (
 			err error
-			t   *ReadWriteTransaction
 		)
 		if sh == nil || sh.getID() == "" || sh.getClient() == nil {
 			// Session handle hasn't been allocated or has been destroyed.
-			sh, err = c.idleSessions.takeWriteSession(ctx)
+			sh, err = c.idleSessions.take(ctx)
 			if err != nil {
 				// If session retrieval fails, just fail the transaction.
 				return err
 			}
-			t = &ReadWriteTransaction{
-				tx: sh.getTransactionID(),
+		}
+		if t.shouldExplicitBegin(attempt) {
+			// Make sure we set the current session handle before calling BeginTransaction.
+			// Note that the t.begin(ctx) call could change the session that is being used by the transaction, as the
+			// BeginTransaction RPC invocation will be retried on a new session if it returns SessionNotFound.
+			t.txReadOnly.sh = sh
+			if err = t.begin(ctx); err != nil {
+				trace.TracePrintf(ctx, nil, "Error while BeginTransaction during retrying a ReadWrite transaction: %v", ToSpannerError(err))
+				return ToSpannerError(err)
 			}
 		} else {
-			t = &ReadWriteTransaction{}
+			t = &ReadWriteTransaction{
+				txReadyOrClosed: make(chan struct{}),
+			}
+			t.txReadOnly.sh = sh
 		}
-		t.txReadOnly.sh = sh
+		attempt++
+		t.txReadOnly.sp = c.idleSessions
 		t.txReadOnly.txReadEnv = t
 		t.txReadOnly.qo = c.qo
-		trace.TracePrintf(ctx, map[string]interface{}{"transactionID": string(sh.getTransactionID())},
+		t.txReadOnly.ro = c.ro
+		t.txReadOnly.disableRouteToLeader = c.disableRouteToLeader
+		t.wb = []*Mutation{}
+		t.txOpts = c.txo.merge(options)
+		t.ct = c.ct
+
+		trace.TracePrintf(ctx, map[string]interface{}{"transactionSelector": t.getTransactionSelector().String()},
 			"Starting transaction attempt")
-		if err = t.begin(ctx); err != nil {
-			return err
-		}
-		ts, err = t.runInTransaction(ctx, f)
+
+		resp, err = t.runInTransaction(ctx, f)
 		return err
 	})
-	if sh != nil {
-		sh.recycle()
-	}
-	return ts, err
+	return resp, err
 }
 
 // applyOption controls the behavior of Client.Apply.
@@ -534,6 +601,10 @@ type applyOption struct {
 	// If atLeastOnce == true, Client.Apply will execute the mutations on Cloud
 	// Spanner at least once.
 	atLeastOnce bool
+	// transactionTag will be included with the CommitRequest.
+	transactionTag string
+	// priority is the RPC priority that is used for the commit operation.
+	priority sppb.RequestOptions_Priority
 }
 
 // An ApplyOption is an optional argument to Apply.
@@ -556,9 +627,30 @@ func ApplyAtLeastOnce() ApplyOption {
 	}
 }
 
+// TransactionTag returns an ApplyOption that will include the given tag as a
+// transaction tag for a write-only transaction.
+func TransactionTag(tag string) ApplyOption {
+	return func(ao *applyOption) {
+		ao.transactionTag = tag
+	}
+}
+
+// Priority returns an ApplyOptions that sets the RPC priority to use for the
+// commit operation.
+func Priority(priority sppb.RequestOptions_Priority) ApplyOption {
+	return func(ao *applyOption) {
+		ao.priority = priority
+	}
+}
+
 // Apply applies a list of mutations atomically to the database.
 func (c *Client) Apply(ctx context.Context, ms []*Mutation, opts ...ApplyOption) (commitTimestamp time.Time, err error) {
 	ao := &applyOption{}
+
+	for _, opt := range c.ao {
+		opt(ao)
+	}
+
 	for _, opt := range opts {
 		opt(ao)
 	}
@@ -567,11 +659,12 @@ func (c *Client) Apply(ctx context.Context, ms []*Mutation, opts ...ApplyOption)
 	defer func() { trace.EndSpan(ctx, err) }()
 
 	if !ao.atLeastOnce {
-		return c.ReadWriteTransaction(ctx, func(ctx context.Context, t *ReadWriteTransaction) error {
+		resp, err := c.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, t *ReadWriteTransaction) error {
 			return t.BufferWrite(ms)
-		})
+		}, TransactionOptions{CommitPriority: ao.priority, TransactionTag: ao.transactionTag})
+		return resp.CommitTs, err
 	}
-	t := &writeOnlyTransaction{c.idleSessions}
+	t := &writeOnlyTransaction{sp: c.idleSessions, commitPriority: ao.priority, transactionTag: ao.transactionTag, disableRouteToLeader: c.disableRouteToLeader}
 	return t.applyAtLeastOnce(ctx, ms...)
 }
 

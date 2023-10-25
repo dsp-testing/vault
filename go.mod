@@ -7,9 +7,9 @@ replace github.com/hashicorp/vault/api => ./api
 replace github.com/hashicorp/vault/sdk => ./sdk
 
 require (
-	cloud.google.com/go v0.56.0
-	cloud.google.com/go/spanner v1.5.1
-	cloud.google.com/go/storage v1.6.0
+	cloud.google.com/go/monitoring v1.16.0
+	cloud.google.com/go/spanner v1.49.0
+	cloud.google.com/go/storage v1.30.1
 	github.com/Azure/azure-sdk-for-go v36.2.0+incompatible
 	github.com/Azure/go-autorest/autorest v0.10.1
 	github.com/DataDog/zstd v1.4.5 // indirect
@@ -46,7 +46,7 @@ require (
 	github.com/go-sql-driver/mysql v1.5.0
 	github.com/go-test/deep v1.0.3
 	github.com/gocql/gocql v0.0.0-20190402132108-0e1d5de854df
-	github.com/golang/protobuf v1.4.2
+	github.com/golang/protobuf v1.5.3
 	github.com/google/go-github v17.0.0+incompatible
 	github.com/google/go-metrics-stackdriver v0.2.0
 	github.com/hashicorp/consul-template v0.25.0
@@ -98,7 +98,7 @@ require (
 	github.com/jefferai/jsonx v1.0.0
 	github.com/joyent/triton-go v1.7.1-0.20200416154420-6801d15b779f
 	github.com/keybase/go-crypto v0.0.0-20190403132359-d65b6b94177f
-	github.com/kr/pretty v0.2.0
+	github.com/kr/pretty v0.3.0
 	github.com/kr/text v0.2.0
 	github.com/lib/pq v1.2.0
 	github.com/mattn/go-colorable v0.1.6
@@ -133,7 +133,7 @@ require (
 	github.com/samuel/go-zookeeper v0.0.0-20180130194729-c4fab1ac1bec
 	github.com/sasha-s/go-deadlock v0.2.0
 	github.com/shirou/gopsutil v2.20.6-0.20200630091542-01afd763e6c0+incompatible
-	github.com/stretchr/testify v1.5.1
+	github.com/stretchr/testify v1.8.3
 	github.com/tidwall/pretty v1.0.1 // indirect
 	github.com/ulikunitz/xz v0.5.7 // indirect
 	github.com/xdg/scram v0.0.0-20180814205039-7eeb5667e42c // indirect
@@ -143,15 +143,15 @@ require (
 	go.etcd.io/etcd v0.5.0-alpha.5.0.20200425165423-262c93980547
 	go.mongodb.org/mongo-driver v1.2.1
 	go.uber.org/atomic v1.6.0
-	golang.org/x/crypto v0.0.0-20200604202706-70a84ac30bf9
-	golang.org/x/net v0.0.0-20200602114024-627f9648deb9
-	golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d
-	golang.org/x/sys v0.0.0-20200625212154-ddb9806d33ae // indirect
-	golang.org/x/time v0.0.0-20200416051211-89c76fbcd5d1
-	golang.org/x/tools v0.0.0-20200416214402-fc959738d646
-	google.golang.org/api v0.24.0
-	google.golang.org/grpc v1.29.1
-	google.golang.org/protobuf v1.24.0
+	golang.org/x/crypto v0.14.0
+	golang.org/x/net v0.16.0
+	golang.org/x/oauth2 v0.13.0
+	golang.org/x/time v0.3.0
+	golang.org/x/tools v0.10.0
+	google.golang.org/api v0.128.0
+	google.golang.org/grpc v1.58.2
+	google.golang.org/grpc/examples v0.0.0-20231024221354-6e14274d008d // indirect
+	google.golang.org/protobuf v1.31.0
 	gopkg.in/mgo.v2 v2.0.0-20180705113604-9856a29383ce
 	gopkg.in/ory-am/dockertest.v3 v3.3.4
 	gopkg.in/square/go-jose.v2 v2.5.1

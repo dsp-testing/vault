@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"time"
 
+	"cloud.google.com/go/monitoring/apiv3/v2/monitoringpb"
 	"github.com/golang/protobuf/proto"
 	gax "github.com/googleapis/gax-go/v2"
 	"google.golang.org/api/iterator"
@@ -30,11 +31,12 @@ import (
 	gtransport "google.golang.org/api/transport/grpc"
 	metricpb "google.golang.org/genproto/googleapis/api/metric"
 	monitoredrespb "google.golang.org/genproto/googleapis/api/monitoredres"
-	monitoringpb "google.golang.org/genproto/googleapis/monitoring/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 )
+
+var newMetricClientHook clientHook
 
 // MetricCallOptions contains the retry settings for each method of MetricClient.
 type MetricCallOptions struct {
@@ -159,7 +161,17 @@ type MetricClient struct {
 // Manages metric descriptors, monitored resource descriptors, and
 // time series data.
 func NewMetricClient(ctx context.Context, opts ...option.ClientOption) (*MetricClient, error) {
-	connPool, err := gtransport.DialPool(ctx, append(defaultMetricClientOptions(), opts...)...)
+	clientOpts := defaultMetricClientOptions()
+
+	if newMetricClientHook != nil {
+		hookOpts, err := newMetricClientHook(ctx, clientHookParams{})
+		if err != nil {
+			return nil, err
+		}
+		clientOpts = append(clientOpts, hookOpts...)
+	}
+
+	connPool, err := gtransport.DialPool(ctx, append(clientOpts, opts...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +203,7 @@ func (c *MetricClient) Close() error {
 // the `x-goog-api-client` header passed on each request. Intended for
 // use by Google-written clients.
 func (c *MetricClient) setGoogleClientInfo(keyval ...string) {
-	kv := append([]string{"gl-go", versionGo()}, keyval...)
+	kv := append([]string{"gl-go", gax.GoVersion}, keyval...)
 	kv = append(kv, "gapic", versionClient, "gax", gax.Version, "grpc", grpc.Version)
 	c.xGoogMetadata = metadata.Pairs("x-goog-api-client", gax.XGoogHeader(kv...))
 }

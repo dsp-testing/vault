@@ -23,16 +23,18 @@ import (
 	"net/url"
 	"time"
 
+	"cloud.google.com/go/monitoring/apiv3/v2/monitoringpb"
 	"github.com/golang/protobuf/proto"
 	gax "github.com/googleapis/gax-go/v2"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	gtransport "google.golang.org/api/transport/grpc"
-	monitoringpb "google.golang.org/genproto/googleapis/monitoring/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 )
+
+var newServiceMonitoringClientHook clientHook
 
 // ServiceMonitoringCallOptions contains the retry settings for each method of ServiceMonitoringClient.
 type ServiceMonitoringCallOptions struct {
@@ -163,7 +165,17 @@ type ServiceMonitoringClient struct {
 // Service's monitored resources, its Service-Level Objectives, and a taxonomy
 // of categorized Health Metrics.
 func NewServiceMonitoringClient(ctx context.Context, opts ...option.ClientOption) (*ServiceMonitoringClient, error) {
-	connPool, err := gtransport.DialPool(ctx, append(defaultServiceMonitoringClientOptions(), opts...)...)
+	clientOpts := defaultServiceMonitoringClientOptions()
+
+	if newServiceMonitoringClientHook != nil {
+		hookOpts, err := newServiceMonitoringClientHook(ctx, clientHookParams{})
+		if err != nil {
+			return nil, err
+		}
+		clientOpts = append(clientOpts, hookOpts...)
+	}
+
+	connPool, err := gtransport.DialPool(ctx, append(clientOpts, opts...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +207,7 @@ func (c *ServiceMonitoringClient) Close() error {
 // the `x-goog-api-client` header passed on each request. Intended for
 // use by Google-written clients.
 func (c *ServiceMonitoringClient) setGoogleClientInfo(keyval ...string) {
-	kv := append([]string{"gl-go", versionGo()}, keyval...)
+	kv := append([]string{"gl-go", gax.GoVersion}, keyval...)
 	kv = append(kv, "gapic", versionClient, "gax", gax.Version, "grpc", grpc.Version)
 	c.xGoogMetadata = metadata.Pairs("x-goog-api-client", gax.XGoogHeader(kv...))
 }

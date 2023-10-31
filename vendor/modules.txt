@@ -494,9 +494,9 @@ github.com/hashicorp/vault-plugin-secrets-mongodbatlas
 # github.com/hashicorp/vault-plugin-secrets-openldap v0.1.4
 github.com/hashicorp/vault-plugin-secrets-openldap
 github.com/hashicorp/vault-plugin-secrets-openldap/client
-# github.com/hashicorp/vault/api v1.0.5-0.20200630205458-1a16f3c699c6 => ./api
+# github.com/hashicorp/vault/api v1.0.5-0.20200717191844-f687267c8086 => ./api
 github.com/hashicorp/vault/api
-# github.com/hashicorp/vault/sdk v0.1.14-0.20200527182800-ad90e0b39d2f => ./sdk
+# github.com/hashicorp/vault/sdk v0.1.14-0.20200717191844-f687267c8086 => ./sdk
 github.com/hashicorp/vault/sdk/database/dbplugin
 github.com/hashicorp/vault/sdk/database/helper/connutil
 github.com/hashicorp/vault/sdk/database/helper/credsutil
@@ -547,7 +547,7 @@ github.com/hashicorp/vault/sdk/testing/stepwise/environments/docker
 github.com/hashicorp/vault/sdk/version
 # github.com/hashicorp/yamux v0.0.0-20181012175058-2f1d1f20f75d
 github.com/hashicorp/yamux
-# github.com/influxdata/influxdb v0.0.0-20190411212539-d24b7ba8c4c4
+# github.com/influxdata/influxdb v1.7.6
 github.com/influxdata/influxdb/client/v2
 github.com/influxdata/influxdb/models
 github.com/influxdata/influxdb/pkg/escape
